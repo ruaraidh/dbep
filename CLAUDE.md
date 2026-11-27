@@ -31,7 +31,7 @@ and **gogo** (consumes them). Keep this package small, stable and free of dynami
 
 ```bash
 python -m pytest -q                      # all tests, about 1 minute
-python examples/example_oscillator.py    # finite-difference errors should stay around 1e-9
+python examples/example_oscillator.py    # after pip install -e .; FD errors around 1e-9 (about 1e-7 for dt: the 1e-3 s step)
 ```
 
 If you change `docs/DBE-P.md`, check that its examples and the section numbers quoted in `dbep.py` and in the companion still match.

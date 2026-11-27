@@ -1,4 +1,6 @@
 """Tests for the DBE-P toolkit: the conversion wrapper, the orientation service and the extended requirement check."""
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -184,3 +186,118 @@ def test_requires_checks_controls_params_orientation():
     msg = str(e.value)
     for frag in ("no control 'acc'", "no parameter 'zz'", "parameter 'g' is not differentiated", "orientation required"):
         assert frag in msg
+
+
+# ----------------------------------------------------------------------------- conformance-suite fixes (dbep 0.6.1)
+T_2026 = 8.5e8          # TDB seconds past J2000 in 2026: where real back-ends run
+
+
+class _Edit:
+    """Wraps a back-end and edits its results, to show that a check catches a wrong implementation."""
+
+    def __init__(self, native, edit):
+        self._n, self._edit = native, edit
+
+    def describe(self):
+        return self._n.describe()
+
+    def step(self, *a):
+        return self._edit(self._n.step(*a))
+
+
+def _with_J(res, **blocks):
+    return StepResult(res.z, {**res.J, **blocks}, res.status, res.meta, res._dense)
+
+
+def test_step_jacobians_at_a_real_epoch():
+    """The epoch is perturbed by an absolute step: with a step relative to |t| (850 s at 2026) J["t"] failed by 1e-3."""
+    b = eo.OscillatorBackend(differentiate=("k",))
+    errs = dbep.check_step_jacobians(b, Z0, U0, T_2026, 10.0, P0)
+    assert errs["t"] < 1e-6 and errs["dt"] < 1e-6
+    wrong = _Edit(b, lambda r: _with_J(r, t=r.J["t"] * 0.0))        # a back-end that forgets the explicit time dependence
+    with pytest.raises(AssertionError, match="Jacobian block t"):
+        dbep.check_step_jacobians(wrong, Z0, U0, T_2026, 10.0, P0)
+
+
+class _Km:
+    """The toy with its state scaled by 1e5, like positions in km: every block grows by 1e5 except J["z"]."""
+    S = 1e5
+
+    def __init__(self):
+        self._n = eo.OscillatorBackend(differentiate=("k",))
+
+    def describe(self):
+        return self._n.describe()
+
+    def step(self, z, u, t, dt, p):
+        r = self._n.step(jnp.asarray(z) / self.S, {k: jnp.asarray(v) / self.S for k, v in u.items()}, t, dt, p)
+        J = {"z": r.J["z"], "t": self.S * r.J["t"], "dt": self.S * r.J["dt"], "u": r.J["u"],
+             "p": {k: self.S * v for k, v in r.J["p"].items()}}
+        return StepResult(self.S * r.z, J, r.status, r.meta, None)
+
+
+def test_tolerance_is_relative_to_the_block():
+    """Blocks of size 1e5 pass with the relative error, and an error of 1e-4 relative is still caught."""
+    km = _Km()
+    z, u = _Km.S * Z0, {"dv": _Km.S * U0["dv"]}
+    errs = dbep.check_step_jacobians(km, z, u, 0.0, 10.0, P0)
+    assert max(errs.values()) < 1e-6
+    wrong = _Edit(km, lambda r: _with_J(r, p={"k": r.J["p"]["k"] * (1 + 1e-4)}))
+    with pytest.raises(AssertionError, match="Jacobian block p.k"):
+        dbep.check_step_jacobians(wrong, z, u, 0.0, 10.0, P0)
+    # per-block settings: a dict with a default
+    dbep.check_step_jacobians(km, z, u, 0.0, 10.0, P0, tol={"default": 1e-6, "p.k": 1e-3})
+
+
+def test_check_refuses_other_protocol_versions():
+    d = eo.OscillatorBackend(differentiate=("k",)).describe()
+    dbep.check(Requires("orbital/1"), d)
+    for bad in ("DBE-P/1.0", "DBE-P/7.3", "DBE-P/0.5", "DBE-P/0.7", "XYZ/0.6", "DBE-P", "garbage"):
+        with pytest.raises(DBEPMismatch, match="protocol"):
+            dbep.check(Requires("orbital/1"), dataclasses.replace(d, protocol=bad))
+
+
+def test_results_cross_jit():
+    b = eo.OscillatorBackend(differentiate=("k",))
+    plain = b.step(Z0, U0, 0.0, 10.0, P0)
+    res = jax.jit(lambda z: b.step(z, U0, 0.0, 10.0, P0))(Z0)
+    assert isinstance(res, StepResult) and res.meta == plain.meta
+    assert np.max(np.abs(np.asarray(res.z) - np.asarray(plain.z))) < 1e-12
+    assert np.max(np.abs(np.asarray(res.J["p"]["k"]) - np.asarray(plain.J["p"]["k"]))) < 1e-12
+    with pytest.raises(RuntimeError, match="inside the function"):
+        res.dense(np.array([5.0]))
+    dn = jax.jit(lambda z: b.step(z, U0, 0.0, 10.0, P0).dense(jnp.array([5.0, 10.0]), partials=True))(Z0)
+    assert dn.meta == plain.meta and np.asarray(dn.J["z"]).shape == (2, 6, 6)
+    w = Converted(b, WANT_SSB, CircleEphemeris())                  # the wrapper too
+    assert jax.jit(lambda z: w.step(z, U0, 0.0, 10.0, P0))(Z0).meta == w.describe().state_meta()
+    assert isinstance(hash(b.describe()), int)                      # a descriptor can be a static argument
+
+
+def test_check_meta_catches_wrong_row_count():
+    b = eo.OscillatorBackend(differentiate=("k",))
+    wrong = _Edit(b, lambda r: _with_J(r, z=r.J["z"][:5]))          # (5, 6): columns right, rows wrong
+    with pytest.raises(AssertionError):
+        dbep.check_meta(wrong, Z0, U0, 0.0, 10.0, P0)
+
+
+def test_chaining_composes_every_block():
+    b = eo.OscillatorBackend(differentiate=("k",))
+    errs = dbep.check_chaining(b, Z0, U0, 0.0, 10.0, 20.0, P0)
+    assert set(errs) == {"state", "stm", "t", "dt", "p.k"}
+    # a constant offset in J["p"] passes a single-step comparison of z but breaks S_k = Phi_k S_k-1 + J_k["p"]
+    wrong = _Edit(b, lambda r: _with_J(r, p={"k": r.J["p"]["k"] + 1e-3}))
+    with pytest.raises(AssertionError, match="p.k"):
+        dbep.check_chaining(wrong, Z0, U0, 0.0, 10.0, 20.0, P0)
+    acc = _Edit(b, lambda r: r)
+    acc.describe = lambda: dataclasses.replace(b.describe(), controls=b.describe().controls + (Control("acc", (2, 3), "acceleration", "km/s^2"),))
+    with pytest.raises(ValueError, match="only impulses"):
+        dbep.check_chaining(acc, Z0, {**U0, "acc": np.ones((2, 3))}, 0.0, 10.0, 20.0, P0)
+
+
+def test_centre_refused_on_a_slice_without_one():
+    class WithGm:
+        def describe(self):
+            d = eo.OscillatorBackend().describe()
+            return dataclasses.replace(d, state=d.state + (Slice("gm:X", 1, "gm", "km^3/s^2"),))
+    with pytest.raises(DBEPUnsupported, match="role 'gm'"):
+        Converted(WithGm(), StateRequest((SliceRequest("gm:X", centre="SUN"),)), CircleEphemeris())
