@@ -631,8 +631,11 @@ def check_step_jacobians(backend: Backend, z, u, t, dt, p, h=1e-6, tol=1e-6, h_t
     epoch a relative step would be about 850 s). The difference quotient divides by the step actually taken, (x+h) - (x-h) in
     float64, which matters for epochs near 1e9 s where float64 resolves only about 1e-7 s.
 
-    Errors: max |FD - J| over the block, divided by max(1, max |J|) of that block, so the tolerance is relative for large blocks
-    (positions in km, sensitivities to small parameters) and absolute for small ones.
+    Errors are scale-free: each column is multiplied by the size s of its input (the max(1, max |x|) of the steps; 1 s for `t` and `dt`),
+    so that J s is the state change for a change of the input of its own size, and the error of the block is max |FD - J| s divided by
+    max(1, max |J s|). A parameter with a large value and a small derivative (the GM of the Sun: J of order 1e-11 km per km^3/s^2, GM
+    1.3e11) is then checked relative to its effect, not absolutely; dividing by max(1, max |J|) alone let a block that was wrong by a
+    factor of two pass.
 
     `h` and `tol` may be dicts {dotted path: value}, with an optional "default", so a back-end can state its tolerance per block.
     Returns the error of every leaf."""
@@ -650,8 +653,8 @@ def check_step_jacobians(backend: Backend, z, u, t, dt, p, h=1e-6, tol=1e-6, h_t
         x = np.asarray(get(inp, path), float)
         Jb = np.asarray(Jb, float)
         h_leaf = _per_leaf(h, name)
-        size = _input_size(x, res.meta if name == "z" else None)
-        worst = 0.0
+        size = np.ones(x.shape) if name in TIME_LEAVES else _input_size(x, res.meta if name == "z" else None)
+        worst = scale = 0.0
         for idx in np.ndindex(x.shape):
             if isinstance(h, dict) and name in h:
                 step_h = h[name]
@@ -663,8 +666,10 @@ def check_step_jacobians(backend: Backend, z, u, t, dt, p, h=1e-6, tol=1e-6, h_t
             xp[idx] += step_h
             xm[idx] -= step_h
             col = (run(put(inp, path, xp)) - run(put(inp, path, xm))) / (xp[idx] - xm[idx])
-            worst = max(worst, float(np.max(np.abs(Jb[(slice(None),) + idx] - col))))
-        err = worst / max(1.0, float(np.max(np.abs(Jb))) if Jb.size else 1.0)
+            Jc = Jb[(slice(None),) + idx]
+            worst = max(worst, float(np.max(np.abs(Jc - col))) * size[idx])          # in units of the state change per input of its own size
+            scale = max(scale, float(np.max(np.abs(Jc))) * size[idx])
+        err = worst / max(1.0, scale)
         errs[name] = err
         tl = _per_leaf(tol, name)
         assert err < tl, f"Jacobian block {name}: relative error {err:.2e} > {tl:.0e}"

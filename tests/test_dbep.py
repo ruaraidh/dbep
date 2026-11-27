@@ -301,3 +301,32 @@ def test_centre_refused_on_a_slice_without_one():
             return dataclasses.replace(d, state=d.state + (Slice("gm:X", 1, "gm", "km^3/s^2"),))
     with pytest.raises(DBEPUnsupported, match="role 'gm'"):
         Converted(WithGm(), StateRequest((SliceRequest("gm:X", centre="SUN"),)), CircleEphemeris())
+
+
+class _BigParam:
+    """The toy with its parameter k expressed as K = k * 1e10: J["p"]["K"] is 1e-10 times the toy's, like the GM of the Sun in an orbit model."""
+    S = 1e10
+
+    def __init__(self):
+        self._n = eo.OscillatorBackend(differentiate=("k",))
+        d = self._n.describe()
+        self._d = dataclasses.replace(d, params=(Param("K", (), 1.0 * self.S, "1/s^2 * 1e10", True), Param("g", (), 0.0, "km/s^2", False)))
+        self._meta = self._d.state_meta()
+
+    def describe(self):
+        return self._d
+
+    def step(self, z, u, t, dt, p):
+        r = self._n.step(z, u, t, dt, {"k": jnp.asarray(p.get("K", self.S)) / self.S, "g": p.get("g", 0.0)})
+        J = {**r.J, "p": {"K": r.J["p"]["k"] / self.S}}
+        return StepResult(r.z, J, r.status, self._meta, None)
+
+
+def test_small_block_of_a_large_parameter_is_checked_relative_to_its_effect():
+    """J["p"]["K"] is about 1e-10: divided by max(1, |J|) its error was absolute, so a factor of 2 passed. Scaled by |K| it is caught."""
+    b = _BigParam()
+    p = {"K": 0.8 * _BigParam.S, "g": 0.05}
+    assert dbep.check_step_jacobians(b, Z0, U0, 0.0, 10.0, p)["p.K"] < 1e-6
+    wrong = _Edit(b, lambda r: _with_J(r, p={"K": 2.0 * r.J["p"]["K"]}))
+    with pytest.raises(AssertionError, match="Jacobian block p.K"):
+        dbep.check_step_jacobians(wrong, Z0, U0, 0.0, 10.0, p)
