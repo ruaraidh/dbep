@@ -252,7 +252,7 @@ def test_tolerance_is_relative_to_the_block():
 def test_check_refuses_other_protocol_versions():
     d = eo.OscillatorBackend(differentiate=("k",)).describe()
     dbep.check(Requires("orbital/1"), d)
-    for bad in ("DBE-P/1.0", "DBE-P/7.3", "DBE-P/0.5", "DBE-P/0.7", "XYZ/0.6", "DBE-P", "garbage"):
+    for bad in ("DBE-P/1.0", "DBE-P/7.3", "DBE-P/0.6", "DBE-P/0.8", "XYZ/0.7", "DBE-P", "garbage"):
         with pytest.raises(DBEPMismatch, match="protocol"):
             dbep.check(Requires("orbital/1"), dataclasses.replace(d, protocol=bad))
 
@@ -330,3 +330,35 @@ def test_small_block_of_a_large_parameter_is_checked_relative_to_its_effect():
     wrong = _Edit(b, lambda r: _with_J(r, p={"K": 2.0 * r.J["p"]["K"]}))
     with pytest.raises(AssertionError, match="Jacobian block p.K"):
         dbep.check_step_jacobians(wrong, Z0, U0, 0.0, 10.0, p)
+
+
+def test_control_frame_is_declared_and_checked():
+    """DBE-P 0.7: a control names the frame of its components. A consumer that needs ICRF impulses is refused a back-end whose impulse is in RTN,
+    which before 0.7 looked identical in the descriptor."""
+    d = eo.OscillatorBackend(differentiate=("k",)).describe()
+    assert d.controls[0].frame == "ICRF"                                           # the default
+    dbep.check(Requires("orbital/1", control_frames=(("dv", "ICRF"),)), d)
+    rtn = dataclasses.replace(d, controls=(Control("dv", (3,), "delta_v", "km/s", "RTN:ORIGIN"),))
+    with pytest.raises(DBEPMismatch, match="frame is 'RTN:ORIGIN', required 'ICRF'"):
+        dbep.check(Requires("orbital/1", control_frames=(("dv", "ICRF"),)), rtn)
+    dbep.check(Requires("orbital/1", control_frames=(("dv", "RTN:ORIGIN"),)), rtn)
+    with pytest.raises(DBEPMismatch, match="no control 'acc'"):
+        dbep.check(Requires("orbital/1", control_frames=(("acc", "ICRF"),)), d)
+    Control("dv", (3,), "delta_v", "km/s", "VNC:EARTH")                         # velocity-aligned is the third frame of orbital/1
+    for bad in ("RTN", "RTN:", "rtn:EARTH", "EME2000", "RTN:EARTH.X", "RTN:A:B", "TNW:EARTH"):
+        with pytest.raises(ValueError, match="frame"):
+            Control("dv", (3,), "delta_v", "km/s", bad)
+
+
+def test_conversion_keeps_the_control_frame():
+    """The frame names its centre, so it stays defined when Converted changes the centre of the state."""
+    class RtnOsc:
+        def __init__(self):
+            self._n = eo.OscillatorBackend(differentiate=("k",))
+            self._d = dataclasses.replace(self._n.describe(), controls=(Control("dv", (3,), "delta_v", "km/s", "RTN:ORIGIN"),))
+        def describe(self):
+            return self._d
+        def step(self, *a):
+            return self._n.step(*a)
+    w = Converted(RtnOsc(), WANT_SSB, CircleEphemeris())
+    assert w.describe().controls[0].frame == "RTN:ORIGIN" and w.describe().state[0].centre == "SSB"

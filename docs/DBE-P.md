@@ -1,7 +1,10 @@
 # DBE-P: dynamics back-end protocol
 
-Status: draft v0.6 (proposal, for review)
+Status: draft v0.7 (proposal, for review)
 Reference code: `dbep.py` (types, requirement check, conformance suite, conversion wrapper `Converted`, quaternion and orientation toolkit), `example_oscillator.py` (toy back-end and consumer), `test_dbep.py` (tests of the toolkit)
+
+Changes from DBE-P v0.6 (minor: an optional field):
+- **Control frames (sections 4, 9, 11, 14).** A control declares the frame of its components: `Control.frame` is `"ICRF"` (the default), `"RTN:<CENTRE>"` or `"VNC:<CENTRE>"`, the local frame of the state relative to CENTRE before the control acts. Named with its centre, it stays defined after `Converted` changes the centre of the state. `Requires.control_frames` states the frame a consumer needs and `check` refuses a mismatch. Before, an impulse in RTN and one in ICRF had identical descriptors, so a consumer could be given the wrong one silently.
 
 Correction in `dbep` 0.6.2 (the protocol stays `DBE-P/0.6`):
 - **Scale-free finite-difference errors (section 13).** 0.6.1 divided the error of a block by `max(1, max |J|)`, so a block of small derivatives with respect to a large parameter (the GM of the Sun in an orbit model) was checked absolutely and could be wrong by a factor of two and pass. Columns are now scaled by the size of their input.
@@ -80,11 +83,11 @@ A back-end publishes `describe() -> Descriptor` with:
 
 | Field | Content |
 |---|---|
-| `protocol` | `"DBE-P/0.6"` |
+| `protocol` | `"DBE-P/0.7"` |
 | `profile` | e.g. `"orbital/1"` |
 | `time` | scale, epoch and unit of `t` and `dt` |
 | `state` | ordered slices: `name`, `size`, `role`, `unit`, `axes`, `centre` |
-| `controls` | `name`, `shape`, `role`, `unit` |
+| `controls` | `name`, `shape`, `role`, `unit`, `frame` |
 | `params` | `name`, `shape`, `default`, `unit`, `differentiated` |
 | `ephemeris` | id of the ephemeris and constants set the model uses, `""` if none |
 | `capabilities` | `level` (0 to 2), `dense`, `batch`, `jit`, `reverse`, `orientation` |
@@ -267,7 +270,7 @@ o.J["p"]["orient:MOON:ra0"]             # (4,)       dq/dparameter, for every di
 
 ## 9. Controls and parameters
 
-- **Controls** are known inputs of a step. Their schema (name, shape, role) is in the descriptor.
+- **Controls** are known inputs of a step. Their schema (name, shape, role, unit, frame) is in the descriptor. `frame` names the axes of the control's vector components (section 14); it is part of the meaning of the control, so a consumer that applies or perturbs a control states the frame it expects (`Requires.control_frames`).
 - **Parameters** are named values. A parameter flagged `differentiated` appears in `J["p"]`. One flagged otherwise is held fixed at the value in `p`. One absent from `p` takes the default.
 - A name MUST NOT appear both as a state slice and as a parameter. A back-end MAY offer the same named scalar in either place (state or parameter) depending on its configuration; the numbers are identical (section 12, rule 5).
 - Process noise (random accelerations, manoeuvre execution error) is the consumer's business. It uses `J["u"]` to map control uncertainty and the slice roles (section 11) to inject noise.
@@ -299,11 +302,11 @@ A consumer states what it needs:
 
 ```python
 Requires(profile="orbital/1", level=2, roles=("position", "velocity"), state=want, dense=True,
-         controls=("dv",), params=("cr_a_m",), estimated=("cr_a_m",), orientation=False)
+         controls=("dv",), params=("cr_a_m",), estimated=("cr_a_m",), orientation=False, control_frames=(("dv", "ICRF"),))
 check(requires, backend.describe())      # raises DBEPMismatch naming every unmet item
 ```
 
-`controls` and `params` must be declared by the model, `estimated` parameters must also be differentiated, and `orientation=True` requires the orientation capability (section 8.6).
+`controls` and `params` must be declared by the model, `estimated` parameters must also be differentiated, `orientation=True` requires the orientation capability (section 8.6), and every `(control, frame)` in `control_frames` must be a declared control in that frame.
 
 `check` MUST be called when a model is constructed, so mismatches appear before any propagation. For every slice in the `StateRequest` it verifies that the realised `centre`, `axes` and `unit` equal what was requested.
 
@@ -394,11 +397,13 @@ Conventions on top of the core for orbital dynamics. This section defines what `
 
 | Name pattern | Role | Meaning |
 |---|---|---|
-| impulse (`dv`) | `delta_v` | impulsive manoeuvre applied at the start of the step, before propagation, in the frame named by the back-end (inertial, RTN, velocity-aligned) **[DECIDED: all three]**. With mass in the state: `m⁺ = m·exp(−|dv|/(Isp·g0))` (dv in km/s, `g0 = 9.80665e-3 km/s²`). Without mass, the impulse is massless. |
+| impulse (`dv`) | `delta_v` | impulsive manoeuvre applied at the start of the step, before propagation, in the frame the control declares (`Control.frame`: `ICRF`, `RTN:<CENTRE>` or `VNC:<CENTRE>`) **[DECIDED: all three]**. With mass in the state: `m⁺ = m·exp(−|dv|/(Isp·g0))` (dv in km/s, `g0 = 9.80665e-3 km/s²`). Without mass, the impulse is massless. |
 | `acc` | `acceleration` | known acceleration, piecewise constant on `n` equal sub-intervals of `dt` (or on fixed fractional knots) |
 | `thrust` | `thrust` | thrust with mass flow; requires `m` in the state (later) |
 
 The impulse frame rotation depends on the state, so the back-end includes `∂R/∂z` in `J["z"]`. Control axes are inertial ICRF unless the control declares otherwise.
+
+**Control frames.** `ICRF`: inertial components. `RTN:<C>`: R along the position, N along the orbit normal (r × v), T = N × R. `VNC:<C>`: V along the velocity, N along the orbit normal, C = V × N. Both are evaluated with the state relative to the centre `C` at the instant the control acts (for an impulse, the start of the step, before it is applied). The centre is part of the name because a conversion (section 8.2) may report the state relative to another centre, where the local frame would differ. A conversion does not change a control's frame: `Converted` passes it through.
 
 **Parameters:** `gm:<body>`, `cr_a_m` (lumped SRP coefficient, used without a mass state) or `cr` and `area` (with mass in the state), `orient:<body>:ra0`, `orient:<body>:dec0`, `orient:<body>:W0`, `orient:<body>:rate` (pole and rotation parameters of an IAU model, each a scalar in rad or rad/s, `W0` at J2000; used by the orientation capability and by forces that use the orientation; more sub-quantities may be added after the second colon).
 
