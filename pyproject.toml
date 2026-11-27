@@ -1,0 +1,20 @@
+[project]
+name = "dbep"
+version = "0.6.0"
+description = "DBE-P, the dynamics back-end protocol: types, requirement check, conformance suite, conversion wrapper and orientation toolkit"
+requires-python = ">=3.10"
+dependencies = ["numpy", "jax"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "examples"]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["dbep"]
