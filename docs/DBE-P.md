@@ -3,6 +3,8 @@
 Status: draft v0.7 (proposal, for review)
 Reference code: `dbep.py` (types, requirement check, conformance suite, conversion wrapper `Converted`, quaternion and orientation toolkit), `example_oscillator.py` (toy back-end and consumer), `test_dbep.py` (tests of the toolkit)
 
+Toolkit change in `dbep` 0.7.1 (protocol unchanged): `Converted` takes a shorter path when no centre of a conversion is an entity of `z`. The conversion is then a translation by an ephemeris state, so its state Jacobian is the identity, and the native state is `z − b(t)`, not the result of a solve. The results are the same, and the cost at every step and dense epoch is lower.
+
 Changes from DBE-P v0.6 (minor: an optional field):
 - **Control frames (sections 4, 9, 11, 14).** A control declares the frame of its components: `Control.frame` is `"ICRF"` (the default), `"RTN:<CENTRE>"` or `"VNC:<CENTRE>"`, the local frame of the state relative to CENTRE before the control acts. Named with its centre, it stays defined after `Converted` changes the centre of the state. `Requires.control_frames` states the frame a consumer needs and `check` refuses a mismatch. Before, an impulse in RTN and one in ICRF had identical descriptors, so a consumer could be given the wrong one silently.
 

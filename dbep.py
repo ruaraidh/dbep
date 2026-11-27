@@ -381,6 +381,9 @@ class Converted:
             if e is not None and ("r:" + e) in [c[4] for c in conv]:
                 raise DBEPUnsupported(f"centre {cr!r} is an entity in z that is itself re-centred in this request")
         self._conv = conv
+        # When no centre of a conversion is an entity of z, T(t)(z) = z + b(t): its state Jacobian is the identity, and the native state is z - b(t).
+        # The general path (a Jacobian, a solve, an inverse) is then exact but needless work at every step and dense epoch.
+        self._translation = not any(c in self._entities for _, _, cn, cr, _ in conv for c in (cn, cr))
         for _, _, cn, cr, _ in conv:                          # every centre must be resolvable (and acyclic)
             for c in (cn, cr):
                 try:
@@ -414,13 +417,17 @@ class Converted:
 
     def _start(self, z, t):
         z0 = jnp.zeros(self._n)
-        M = jax.jacfwd(self._T, 0)(z0, t)                     # T is affine in z
         b = self._T(z0, t)
+        if self._translation:
+            zn = z - b
+            return zn, jnp.eye(self._n), jax.jacfwd(self._T, 1)(zn, t)
+        M = jax.jacfwd(self._T, 0)(z0, t)                     # T is affine in z
         zn = jnp.linalg.solve(M, z - b)
         return zn, jnp.linalg.inv(M), jax.jacfwd(self._T, 1)(zn, t)
 
     def _end(self, zn, te):
-        return self._T(zn, te), jax.jacfwd(self._T, 0)(zn, te), jax.jacfwd(self._T, 1)(zn, te)
+        Me = jnp.eye(self._n) if self._translation else jax.jacfwd(self._T, 0)(zn, te)
+        return self._T(zn, te), Me, jax.jacfwd(self._T, 1)(zn, te)
 
     @staticmethod
     def _jtree(Jn, Me, dTe, M0inv, dT0):

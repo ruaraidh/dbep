@@ -362,3 +362,23 @@ def test_conversion_keeps_the_control_frame():
             return self._n.step(*a)
     w = Converted(RtnOsc(), WANT_SSB, CircleEphemeris())
     assert w.describe().controls[0].frame == "RTN:ORIGIN" and w.describe().state[0].centre == "SSB"
+
+
+def test_translation_path_equals_the_general_path():
+    """A conversion whose centres all come from the ephemeris is a translation: Converted then skips the Jacobian, solve and inverse of the general
+    path. Both paths give the same step and dense output (all blocks); a centre that is an entity of z keeps the general path."""
+    want = StateRequest(slices=(SliceRequest("r", centre="PLANET"), SliceRequest("v", centre="PLANET")))
+    fast = Converted(eo.OscillatorBackend(differentiate=("k",)), want, CircleEphemeris())
+    general = Converted(eo.OscillatorBackend(differentiate=("k",)), want, CircleEphemeris())
+    assert fast._translation
+    general._translation = False                                       # force the general path on the same conversion
+    a, b = fast.step(Z0, U0, 3.0, 10.0, P0), general.step(Z0, U0, 3.0, 10.0, P0)
+    assert np.max(np.abs(np.asarray(a.z) - np.asarray(b.z))) < 1e-12
+    for path, leaf in dbep.leaves(b.J):
+        assert np.max(np.abs(np.asarray(leaf) - np.asarray(dbep.get(a.J, path)))) < 1e-12, path
+    tv = np.array([5.0, 13.0])
+    da, db = a.dense(tv, partials=True), b.dense(tv, partials=True)
+    for path, leaf in dbep.leaves(db.J):
+        assert np.max(np.abs(np.asarray(leaf) - np.asarray(dbep.get(da.J, path)))) < 1e-12, path
+    entity = Converted(TwoOsc(), StateRequest(slices=(SliceRequest("r", centre="AST"), SliceRequest("v", centre="AST"))), CircleEphemeris())
+    assert not entity._translation
