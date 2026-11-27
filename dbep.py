@@ -145,7 +145,8 @@ class Descriptor:
     capabilities: Capabilities
     ephemeris: str = ""
     status_bits: dict = field(default_factory=lambda: {1: "max_steps", 2: "underflow", 3: "out_of_coverage",
-                                                        4: "impact", 5: "non_finite"})
+                                                        4: "impact", 5: "non_finite"},
+                              hash=False)    # compared, but left out of the hash so a Descriptor can be a static jit argument
     protocol: str = PROTOCOL
 
     @property
@@ -191,6 +192,23 @@ class DenseResult:
     J: Optional[dict] = None                         # same tree as StepResult.J with a leading n_t axis; None if partials=False
 
 
+def _dense_not_carried(t_vec, partials=False):
+    raise RuntimeError("this StepResult was rebuilt from its leaves (for example returned from jax.jit), which does not carry "
+                       "dense output: call res.dense(...) inside the function that called step")
+
+
+# Results are pytrees, so they can be returned from jax.jit, vmapped and tree-mapped. The arrays are the leaves; `meta` is static
+# (aux data). The dense closure is not an array and may hold tracers, so it is not carried across a rebuild.
+jax.tree_util.register_pytree_node(
+    StepResult,
+    lambda r: ((r.z, r.J, r.status), r.meta),
+    lambda meta, ch: StepResult(z=ch[0], J=ch[1], status=ch[2], meta=meta, _dense=_dense_not_carried))
+jax.tree_util.register_pytree_node(
+    DenseResult,
+    lambda r: ((r.z, r.J), r.meta),
+    lambda meta, ch: DenseResult(z=ch[0], meta=meta, J=ch[1]))
+
+
 class Backend(Protocol):
     def describe(self) -> Descriptor: ...
 
@@ -215,11 +233,30 @@ class DBEPMismatch(Exception):
     pass
 
 
+def _version(protocol: str):
+    """'DBE-P/0.6' -> ('DBE-P', 0, 6); None if the string is not of that form."""
+    name, _, ver = protocol.partition("/")
+    major, _, minor = ver.partition(".")
+    try:
+        return name, int(major), int(minor)
+    except ValueError:
+        return None
+
+
+def compatible_protocol(protocol: str) -> bool:
+    """Section 16: the name and the major version must match. While the protocol is a draft (major 0) any change may break,
+    so the minor version must match as well."""
+    have, want = _version(protocol), _version(PROTOCOL)
+    if have is None or have[:2] != want[:2]:
+        return False
+    return want[1] != 0 or have[2] == want[2]
+
+
 def check(req: Requires, desc: Descriptor) -> None:
     """Raise with every unmet requirement named, or return None."""
     problems = []
-    if desc.protocol.split("/")[0] != PROTOCOL.split("/")[0]:
-        problems.append(f"protocol {desc.protocol!r} is not {PROTOCOL!r}")
+    if not compatible_protocol(desc.protocol):
+        problems.append(f"protocol {desc.protocol!r} is not compatible with {PROTOCOL!r} (section 16)")
     if desc.profile != req.profile:
         problems.append(f"profile {desc.profile!r} != required {req.profile!r}")
     if desc.capabilities.level < req.level:
@@ -296,6 +333,8 @@ class Converted:
                 raise DBEPUnsupported(f"slice {sr.name!r}: native axes {have.axes!r} cannot be converted to {sr.axes!r}")
             if sr.unit and sr.unit != have.unit:
                 raise DBEPUnsupported(f"slice {sr.name!r}: unit {sr.unit!r} requested, native is {have.unit!r}")
+            if sr.centre and have.role not in ("position", "velocity"):
+                raise DBEPUnsupported(f"slice {sr.name!r} has role {have.role!r}: a centre can only be requested for a position or velocity")
         self._entities = {}                                   # body -> (r slice, v slice, native centre)
         for name, (sl, s) in idx.items():
             if s.role == "position" and name.startswith("r:") and "v:" + name[2:] in idx:
@@ -549,16 +588,54 @@ def check_meta(backend: Backend, z, u, t, dt, p) -> None:
     d = backend.describe()
     res = backend.step(z, u, t, dt, p)
     assert res.meta == d.state_meta(), "result meta differs from the descriptor's"
-    assert np.asarray(res.z).shape == (res.meta.n_z,), "z does not have the length the meta declares"
+    n_z = res.meta.n_z
+    assert np.asarray(res.z).shape == (n_z,), "z does not have the length the meta declares"
     got = {(".".join(path), tuple(np.asarray(leaf).shape[1:])) for path, leaf in leaves(res.J)}
     assert got == set(res.meta.jacobian), f"Jacobian tree differs from meta: {got ^ set(res.meta.jacobian)}"
+    for path, leaf in leaves(res.J):
+        assert np.asarray(leaf).shape[:1] == (n_z,), f"Jacobian block {'.'.join(path)} has {np.asarray(leaf).shape[:1]} rows, not n_z = {n_z}"
     if d.capabilities.dense:
         dn = res.dense(np.array([t + dt]), partials=True)
         assert dn.meta == res.meta, "dense meta differs from step meta"
 
 
-def check_step_jacobians(backend: Backend, z, u, t, dt, p, h=1e-6, tol=1e-6) -> dict:
-    """Every leaf of the returned Jacobian tree against central differences of `step`."""
+def _per_leaf(value, path: str):
+    """A setting given either as one number or as a dict {dotted path: number} (paths not in the dict take its "default", if any)."""
+    if isinstance(value, dict):
+        return value.get(path, value.get("default"))
+    return value
+
+
+TIME_LEAVES = ("t", "dt")
+
+
+def _input_size(x, meta=None):
+    """The size each component's step is scaled by: max(1, max |x|) over the quantity the component belongs to (one state slice of z,
+    or the whole input array), not the component alone, so that a near-zero component of a large vector is not given a tiny step."""
+    x = np.abs(np.asarray(x, float))
+    if meta is None:
+        return np.full(x.shape, max(1.0, float(np.max(x))) if x.size else 1.0)
+    out = np.empty(x.shape)
+    for s in meta.slices:
+        sl = meta.index(s.name)
+        out[sl] = max(1.0, float(np.max(x[sl])))
+    return out
+
+
+def check_step_jacobians(backend: Backend, z, u, t, dt, p, h=1e-6, tol=1e-6, h_time=1e-3) -> dict:
+    """Every leaf of the returned Jacobian tree against central differences of `step`.
+
+    Steps: a component of an input is perturbed by h * max(1, max |x|), the maximum taken over its state slice (for z) or over the
+    whole input array (for a control or parameter), except the epoch inputs `t` and `dt`, which are perturbed by the absolute
+    step `h_time` [s]: an epoch is an offset from J2000, so its size says nothing about the time scale of the dynamics (at a 2026
+    epoch a relative step would be about 850 s). The difference quotient divides by the step actually taken, (x+h) - (x-h) in
+    float64, which matters for epochs near 1e9 s where float64 resolves only about 1e-7 s.
+
+    Errors: max |FD - J| over the block, divided by max(1, max |J|) of that block, so the tolerance is relative for large blocks
+    (positions in km, sensitivities to small parameters) and absolute for small ones.
+
+    `h` and `tol` may be dicts {dotted path: value}, with an optional "default", so a back-end can state its tolerance per block.
+    Returns the error of every leaf."""
     d = backend.describe()
     u, p = complete(d, u, p)
     inp = {"z": z, "u": u, "t": t, "dt": dt, "p": p}
@@ -569,18 +646,28 @@ def check_step_jacobians(backend: Backend, z, u, t, dt, p, h=1e-6, tol=1e-6) -> 
 
     errs = {}
     for path, Jb in leaves(res.J):
+        name = ".".join(path)
         x = np.asarray(get(inp, path), float)
         Jb = np.asarray(Jb, float)
+        h_leaf = _per_leaf(h, name)
+        size = _input_size(x, res.meta if name == "z" else None)
         worst = 0.0
         for idx in np.ndindex(x.shape):
-            step_h = h * max(1.0, abs(x[idx]))
+            if isinstance(h, dict) and name in h:
+                step_h = h[name]
+            elif name in TIME_LEAVES:
+                step_h = h_time
+            else:
+                step_h = h_leaf * size[idx]
             xp, xm = x.copy(), x.copy()
             xp[idx] += step_h
             xm[idx] -= step_h
-            col = (run(put(inp, path, xp)) - run(put(inp, path, xm))) / (2 * step_h)
+            col = (run(put(inp, path, xp)) - run(put(inp, path, xm))) / (xp[idx] - xm[idx])
             worst = max(worst, float(np.max(np.abs(Jb[(slice(None),) + idx] - col))))
-        errs[".".join(path)] = worst
-        assert worst < tol, f"Jacobian block {'.'.join(path)}: max error {worst:.2e} > {tol:.0e}"
+        err = worst / max(1.0, float(np.max(np.abs(Jb))) if Jb.size else 1.0)
+        errs[name] = err
+        tl = _per_leaf(tol, name)
+        assert err < tl, f"Jacobian block {name}: relative error {err:.2e} > {tl:.0e}"
     return errs
 
 
@@ -602,12 +689,32 @@ def check_dense(backend: Backend, z, u, t, dt, p, tol=1e-9) -> dict:
 
 
 def check_chaining(backend: Backend, z, u, t, dt1, dt2, p, tol=1e-5) -> dict:
-    """step(t, dt1+dt2) == step(t, dt1) then step(t+dt1, dt2) with zero controls; STMs compose."""
+    """step(t, dt1+dt2) equals step(t, dt1) followed by step(t+dt1, dt2) with zero controls, and the blocks compose by
+    section 12: J["z"] = Jb_z Ja_z, J["p"] = Jb_z Ja_p + Jb_p, J["t"] = Jb_z Ja_t + Jb_t, J["dt"] = Jb_dt.
+
+    Only impulses (role "delta_v", applied at the start of the step) may be non-zero in `u`: a control spread over the step, such as
+    a piecewise acceleration on sub-intervals of dt, is not the same control on the longer step, so the identity does not hold.
+    Errors are relative to max(1, max |reference|) of each quantity."""
     d = backend.describe()
+    for c in d.controls:
+        if c.role != "delta_v" and c.name in u and np.any(np.asarray(u[c.name]) != 0):
+            raise ValueError(f"check_chaining: control {c.name!r} (role {c.role!r}) must be zero; only impulses are chained")
     whole = backend.step(z, u, t, dt1 + dt2, p)
     a = backend.step(z, u, t, dt1, p)
     b = backend.step(a.z, zero_controls(d), t + dt1, dt2, p)
-    e_z = float(np.max(np.abs(np.asarray(whole.z) - np.asarray(b.z))))
-    e_J = float(np.max(np.abs(np.asarray(whole.J["z"]) - np.asarray(b.J["z"]) @ np.asarray(a.J["z"]))))
-    assert max(e_z, e_J) < tol, (e_z, e_J)
-    return {"state": e_z, "stm": e_J}
+    A = {k: np.asarray(v) for k, v in a.J.items() if k not in ("u", "p")}
+    B = {k: np.asarray(v) for k, v in b.J.items() if k not in ("u", "p")}
+
+    def rel(ref, got):
+        ref, got = np.asarray(ref, float), np.asarray(got, float)
+        return float(np.max(np.abs(ref - got))) / max(1.0, float(np.max(np.abs(ref))))
+
+    errs = {"state": rel(whole.z, b.z),
+            "stm": rel(whole.J["z"], B["z"] @ A["z"]),
+            "t": rel(whole.J["t"], B["z"] @ A["t"] + B["t"]),
+            "dt": rel(whole.J["dt"], B["dt"])}
+    for name, Jw in whole.J.get("p", {}).items():
+        errs["p." + name] = rel(Jw, np.tensordot(B["z"], np.asarray(a.J["p"][name]), axes=1) + np.asarray(b.J["p"][name]))
+    bad = {k: v for k, v in errs.items() if v >= tol}
+    assert not bad, f"chaining: errors above {tol:.0e}: " + ", ".join(f"{k} {v:.2e}" for k, v in bad.items())
+    return errs

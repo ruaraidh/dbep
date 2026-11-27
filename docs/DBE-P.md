@@ -3,6 +3,14 @@
 Status: draft v0.6 (proposal, for review)
 Reference code: `dbep.py` (types, requirement check, conformance suite, conversion wrapper `Converted`, quaternion and orientation toolkit), `example_oscillator.py` (toy back-end and consumer), `test_dbep.py` (tests of the toolkit)
 
+Corrections in the reference toolkit `dbep` 0.6.1 (the protocol stays `DBE-P/0.6`; the text changes below only clarify it):
+- **Finite-difference steps and tolerances (section 13).** `check_step_jacobians` perturbs the epoch inputs `t` and `dt` by an absolute step (`h_time`, default 1e-3 s). The earlier step, relative to `|t|`, was about 850 s at a 2026 epoch and failed a correct `J["t"]`. Other inputs are stepped relative to the size of their state slice or input array, not of the single component. Errors are relative to the size of each block, and `h` and `tol` can be given per block.
+- **Chaining (section 13, test 6)** also checks the composition of `J["p"]`, `J["t"]` and `J["dt"]` (section 12), and refuses non-impulsive controls, for which the identity does not hold.
+- **Version check (section 16).** `check` compared only the protocol name, so any version passed. It now refuses a different major version and, while the major version is 0, a different minor version.
+- **Results cross `jax.jit` (section 3).** `StepResult` and `DenseResult` are JAX pytrees, with `meta` as static data. The dense closure is not carried across a jit boundary: call `dense` inside the jitted function.
+- `check_meta` checks the row count of every block. `Converted` refuses a centre requested for a slice that is not a position or velocity. `Descriptor` is hashable.
+- Clarified: the status bitmask (section 10) and the coordinates of process noise (section 12, rule 4).
+
 Changes from DBE-P v0.5:
 - **Conversion wrapper.** `dbep.Converted(native_backend, state_request, ephemeris)` implements section 8.2 once, for any back-end that has a native `step`. A back-end needs no conversion code of its own. It needs an `EphemerisProvider` (section 8.2, rule 9). This settles where the conversion toolkit lives (it is in `dbep`).
 - **Orientation capability (section 8.6).** A back-end MAY provide `orientation(body, t, p)`, returning a unit quaternion (scalar-first, body-fixed to ICRF) with its derivatives with respect to `t` and the differentiated orientation parameters. `dbep` provides quaternion helpers and a reference IAU service, `IAUOrientation`, that a back-end and a consumer can share. New descriptor capability `orientation`, new `Requires.orientation`, new conformance test 10.
@@ -61,6 +69,7 @@ The protocol has a domain-neutral **core** (sections 3 to 13) and **profiles** (
 - **Input tree.** `{"z": array, "u": {name: array}, "t": scalar, "dt": scalar, "p": {name: array}}`.
 - **Paths.** Jacobian leaves are addressed by the same dotted paths as the inputs: `"z"`, `"u.dv"`, `"p.k"`, `"t"`, `"dt"`.
 - **Batch axis.** Where stated, a leading batch or epoch axis MAY be added to array leaves. A back-end declares support in `capabilities.batch`.
+- **Results under jit.** `StepResult` and `DenseResult` are pytrees: their arrays are the leaves and `meta` is static, so a result can be returned from a jitted function. The dense output of a step is a closure, not an array, and is not carried out of a jitted function: call `res.dense(...)` inside it.
 
 ## 4. Descriptor
 
@@ -262,11 +271,11 @@ o.J["p"]["orient:MOON:ra0"]             # (4,)       dq/dparameter, for every di
 
 ## 10. Status
 
-`res.status` is an int bitmask per batch member:
+`res.status` is an int bitmask per batch member. `status == 0` means no condition was raised. Bit `k` is the value `1 << k`, so `max_steps` alone gives `status == 2`. Bit 0 is reserved and never set. `status_bits` in the descriptor maps the bit number `k` to its name.
 
 | Bit | Meaning |
 |---|---|
-| 0 | OK |
+| 0 | reserved |
 | 1 | `max_steps` exceeded |
 | 2 | step-size underflow |
 | 3 | outside coverage (ephemeris, orientation) |
@@ -311,7 +320,7 @@ Let step `k` start at `t_k` with state `z_k`, and let `Φ_k = res_k.J["z"]`.
    ```
 
    For a time-tag error: `∂obs/∂t_i = ∂g/∂G · ( ∂G/∂t|explicit + ∂G/∂z · d.J["dt"](t_i) )`. For Doppler the consumer uses both a position and a velocity slice.
-4. **Process noise** is added by the consumer at step boundaries, in the back-end's coordinates.
+4. **Process noise** is added by the consumer at step boundaries, in the requested coordinates (section 8.1), which are the coordinates of `z`.
 5. **State/parameter equivalence:** a named scalar declared as a state slice gives `J["p"][name]` of a parameter-based model as the corresponding column of `J["z"]`, restricted to the dynamic rows. The row of that slice in `J["z"]` is the unit vector.
 6. **Mixed back-ends in a chain** (for example an analytic Kepler arc followed by a numeric arc): both honour the same `StateRequest` (section 8.4, point 3), so layout and coordinates agree. A slice present on one side only is carried or dropped by the consumer.
 
@@ -332,16 +341,19 @@ Back-end tests:
 1. **Meta consistency:** `res.meta` equals the descriptor's meta; `z` has length `n_z`; the Jacobian tree has exactly the leaves in `meta.jacobian`.
 2. **Requested coordinates:** `check` passes with the `StateRequest` the model was built with; an unsupported request is refused at construction with `DBEPUnsupported`.
 3. **Finite differences:** every leaf of the returned Jacobian tree against central differences of `step`, to a stated tolerance, on the model *as built with the request* (so the time terms from a moving centre are exercised).
+   - *Steps.* The epoch inputs `t` and `dt` take an absolute step (`h_time`, default 1e-3 s). An epoch is an offset from J2000, so its size says nothing about the time scale of the dynamics. Every other component takes `h · max(1, max |x|)`, the maximum taken over its state slice (for `z`) or its whole input array, so a near-zero component of a large vector does not get a tiny step. The quotient divides by the step actually taken in float64.
+   - *Errors* are `max |FD − J|` over a block divided by `max(1, max |J|)` of that block: relative for large blocks, absolute for small ones. A back-end states its tolerance, per block where needed (`tol={"default": ..., "p.cr_a_m": ...}`), and tests at an epoch where it is used (around 8e8 s for the 2020s), not only near `t = 0`.
+   - *Epoch resolution.* float64 resolves about 1.2e-7 s at 8.5e8 s. A back-end that forms internal times as `t + i·h` carries rounding noise of that order into its results, and that noise is divided by the step in a finite difference. This is why `h_time` is not smaller.
 4. **Conversion consistency:** the same physics built natively and with a converted request differ by exactly the conversion `T`; `J["z"]` follows from the Jacobian of `T`.
 5. **Dense consistency:** `dense` at `t+dt` equals the step result; `dense` at `t+dt/2` equals a step of half the duration (including its Jacobians with `partials=True`); `partials=False` returns no Jacobian tree.
-6. **Chaining:** one step of `dt1+dt2` equals two steps with zero controls in the second, with `Φ` composed.
+6. **Chaining:** one step of `dt1+dt2` equals two steps with zero controls in the second, and the blocks compose by section 12: `J["z"] = Φ_2 Φ_1`, `J["p"] = Φ_2 J_1["p"] + J_2["p"]`, `J["t"] = Φ_2 J_1["t"] + J_2["t"]`, `J["dt"] = J_2["dt"]`. Only impulses may be non-zero: a control spread over the step (a piecewise acceleration on sub-intervals of `dt`) is not the same control on the longer step.
 7. **State/parameter equivalence** (where a back-end offers both).
 8. **Status:** out-of-coverage and impact return the right bit.
 9. **Batch:** a batched call equals a loop (where `batch` is claimed).
 
 Consumer-side test (in `example_oscillator.py`): the observation Jacobians built from `dense` and the chain agree with finite differences of the whole pipeline, with no consumer-side conversion.
 
-The consumer test also covers the boundary-epoch derivative of section 12, rule 7. The toy back-end exercises tests 1 to 6 and the consumer tests, with finite-difference errors around 1e-9 (test 4 is printed in the demo, not asserted). Tests 7 to 9 are not exercised by it.
+The consumer test also covers the boundary-epoch derivative of section 12, rule 7. The toy back-end exercises tests 1 to 6 and the consumer tests, with finite-difference errors around 1e-9, and around 1e-7 for `J["dt"]`, which is the truncation error of the 1e-3 s step on the toy's fast dynamics (test 4 is printed in the demo, not asserted). `test_dbep.py` also runs test 3 at a 2026 epoch. Tests 7 to 9 are not exercised by it.
 
 10. **Orientation** (where `capabilities.orientation`): unit quaternion; proper rotation matrix; `quat_rotate` agrees with the matrix; every leaf of `o.J` against central differences (`dbep.check_orientation`).
 
@@ -397,7 +409,7 @@ The impulse frame rotation depends on the state, so the back-end includes `∂R/
 
 ## 16. Versioning
 
-`DBE-P/<major>.<minor>`. Adding optional descriptor fields, roles, controls or capabilities is a minor change. Changing shapes, tree structure, Jacobian definitions, axes or units is a major change. While the protocol is a draft (0.x), any change may break. A profile has its own integer version (`orbital/1`). A consumer MUST refuse a back-end whose protocol major version differs.
+`DBE-P/<major>.<minor>`. Adding optional descriptor fields, roles, controls or capabilities is a minor change. Changing shapes, tree structure, Jacobian definitions, axes or units is a major change. While the protocol is a draft (0.x), any change may break. A profile has its own integer version (`orbital/1`). A consumer MUST refuse a back-end whose protocol major version differs. While the major version is 0, it MUST also refuse a different minor version, since any change may break. `dbep.compatible_protocol` implements this rule and `check` applies it.
 
 ## 17. Open questions
 
