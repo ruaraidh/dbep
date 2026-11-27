@@ -2,7 +2,7 @@
 
 The dynamics back-end protocol (DBE-P) and its reference toolkit.
 
-- `docs/DBE-P.md`: the protocol (draft v0.6). This is the source of truth.
+- `docs/DBE-P.md`: the protocol (draft v0.7). This is the source of truth.
 - `docs/DBE-P-companion.md`: how didi becomes a back-end and how gogo consumes back-ends.
 - `dbep.py`: types, `check`, the conformance suite, `Converted` (centre conversion wrapper), the quaternion helpers and `IAUOrientation`.
 - `examples/example_oscillator.py`: a toy back-end and a consumer (run it: `python examples/example_oscillator.py`).

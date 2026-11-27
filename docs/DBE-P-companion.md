@@ -1,6 +1,6 @@
 # DBE-P companion: one back-end and one consumer
 
-Companion to `DBE-P.md` (draft v0.6). It describes how a specific numerical propagator (didi) is made a DBE-P back-end, and how a specific consumer (gogo) uses back-ends. It is not part of the protocol. Section numbers of DBE-P.md are referred to as "DBE-P section N".
+Companion to `DBE-P.md` (draft v0.7). It describes how a specific numerical propagator (didi) is made a DBE-P back-end, and how a specific consumer (gogo) uses back-ends. It is not part of the protocol. Section numbers of DBE-P.md are referred to as "DBE-P section N".
 
 ## 1. The didi adapter
 

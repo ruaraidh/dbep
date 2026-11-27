@@ -1,4 +1,4 @@
-"""DBE-P: dynamics back-end protocol, draft 0.6.
+"""DBE-P: dynamics back-end protocol, draft 0.7.
 
 Types, a requirement check and a conformance suite. No dynamics live here.
 A *back-end* implements `Backend`; a *consumer* states what it needs with
@@ -35,7 +35,7 @@ import numpy as np
 jax.config.update("jax_enable_x64", True)          # the protocol is float64
 
 Array = Any
-PROTOCOL = "DBE-P/0.6"
+PROTOCOL = "DBE-P/0.7"
 
 
 # ----------------------------------------------------------------------------- descriptor pieces
@@ -88,6 +88,21 @@ class Control:
     shape: tuple
     role: str            # "delta_v", "acceleration", "thrust", ...
     unit: str = ""
+    frame: str = "ICRF"  # axes of the control's vector components (section 9): "ICRF", "RTN:<CENTRE>" (radial, transverse, normal) or
+                         # "VNC:<CENTRE>" (velocity, normal, co-normal), both of the state relative to CENTRE before the control acts.
+                         # Named with its centre, so it stays defined after a conversion.
+
+    def __post_init__(self):
+        if not valid_frame(self.frame):
+            raise ValueError(f"control {self.name!r}: frame {self.frame!r} is not 'ICRF', 'RTN:<CENTRE>' or 'VNC:<CENTRE>'")
+
+
+def valid_frame(frame: str) -> bool:
+    """'ICRF', or 'RTN:<CENTRE>' / 'VNC:<CENTRE>' with a centre name that follows the naming rule (no '.', ',' or ':')."""
+    if frame == "ICRF":
+        return True
+    kind, _, centre = frame.partition(":")
+    return kind in ("RTN", "VNC") and bool(centre) and not any(ch in centre for ch in ".,:")
 
 
 @dataclass(frozen=True)
@@ -227,6 +242,7 @@ class Requires:
     params: tuple = ()                               # parameter names the model must declare
     estimated: tuple = ()                            # parameter names that must be differentiated (appear in J["p"])
     orientation: bool = False                        # the back-end must provide orientation()
+    control_frames: tuple = ()                       # ((control name, frame), ...): the frame each named control must be given in
 
 
 class DBEPMismatch(Exception):
@@ -268,10 +284,15 @@ def check(req: Requires, desc: Descriptor) -> None:
             problems.append(f"no state slice with role {r!r}")
     if req.orientation and not desc.capabilities.orientation:
         problems.append("orientation required but not provided")
-    have_c = {c.name for c in desc.controls}
+    have_c = {c.name: c for c in desc.controls}
     for c in req.controls:
         if c not in have_c:
             problems.append(f"no control {c!r}")
+    for c, frame in req.control_frames:
+        if c not in have_c:
+            problems.append(f"no control {c!r} (frame {frame!r} required)")
+        elif have_c[c].frame != frame:
+            problems.append(f"control {c!r}: frame is {have_c[c].frame!r}, required {frame!r}")
     have_p = {q.name: q for q in desc.params}
     for q in req.params:
         if q not in have_p:
