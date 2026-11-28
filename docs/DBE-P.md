@@ -3,6 +3,8 @@
 Status: draft v0.7 (proposal, for review)
 Reference code: `dbep.py` (types, requirement check, conformance suite, conversion wrapper `Converted`, quaternion and orientation toolkit), `example_oscillator.py` (toy back-end and consumer), `test_dbep.py` (tests of the toolkit)
 
+Toolkit change in `dbep` 0.7.2 (protocol unchanged): `check_dense` measures errors relative to each block, and at the half step compares impulses only (other controls must be zero), as `check_chaining` does. Before, one absolute tolerance covered blocks of very different sizes, and a correct back-end with a piecewise acceleration failed.
+
 Toolkit change in `dbep` 0.7.1 (protocol unchanged): `Converted` takes a shorter path when no centre of a conversion is an entity of `z`. The conversion is then a translation by an ephemeris state, so its state Jacobian is the identity, and the native state is `z − b(t)`, not the result of a solve. The results are the same, and the cost at every step and dense epoch is lower.
 
 Changes from DBE-P v0.6 (minor: an optional field):
@@ -353,7 +355,7 @@ Back-end tests:
    - *Errors* are scale-free: each column is multiplied by the size `s` of its input (the `max(1, max |x|)` of the steps; 1 s for `t` and `dt`), so that `J s` is the state change for a change of the input of its own size, and the error of a block is `max |FD − J| s` divided by `max(1, max |J s|)`. A parameter with a large value and a small derivative (the GM of the Sun) is then checked relative to its effect. A back-end states its tolerance, per block where needed (`tol={"default": ..., "p.cr_a_m": ...}`), and tests at an epoch where it is used (around 8e8 s for the 2020s), not only near `t = 0`.
    - *Epoch resolution.* float64 resolves about 1.2e-7 s at 8.5e8 s. A back-end that forms internal times as `t + i·h` carries rounding noise of that order into its results, and that noise is divided by the step in a finite difference. This is why `h_time` is not smaller.
 4. **Conversion consistency:** the same physics built natively and with a converted request differ by exactly the conversion `T`; `J["z"]` follows from the Jacobian of `T`.
-5. **Dense consistency:** `dense` at `t+dt` equals the step result; `dense` at `t+dt/2` equals a step of half the duration (including its Jacobians with `partials=True`); `partials=False` returns no Jacobian tree.
+5. **Dense consistency:** `dense` at `t+dt` equals the step result; `dense` at `t+dt/2` equals a step of half the duration (including its Jacobians with `partials=True`); `partials=False` returns no Jacobian tree. Errors are relative to each block. At the half step only impulses are compared among the controls, and other controls must be zero: a control spread over the step is defined relative to it. The tolerance follows the back-end's accuracy: for a fixed-step integrator, `J["dt"]` of dense output (offset on the step's grid) and of a half-length step (duration, grid scaling) differ by the truncation error.
 6. **Chaining:** one step of `dt1+dt2` equals two steps with zero controls in the second, and the blocks compose by section 12: `J["z"] = Φ_2 Φ_1`, `J["p"] = Φ_2 J_1["p"] + J_2["p"]`, `J["t"] = Φ_2 J_1["t"] + J_2["t"]`, `J["dt"] = J_2["dt"]`. Only impulses may be non-zero: a control spread over the step (a piecewise acceleration on sub-intervals of `dt`) is not the same control on the longer step.
 7. **State/parameter equivalence** (where a back-end offers both).
 8. **Status:** out-of-coverage and impact return the right bit.

@@ -704,19 +704,42 @@ def check_step_jacobians(backend: Backend, z, u, t, dt, p, h=1e-6, tol=1e-6, h_t
     return errs
 
 
+def _rel(ref, got):
+    """max |ref - got| relative to the larger of the two blocks (0 when both are zero)."""
+    ref, got = np.asarray(ref, float), np.asarray(got, float)
+    scale = max(float(np.max(np.abs(ref))) if ref.size else 0.0, float(np.max(np.abs(got))) if got.size else 0.0)
+    return float(np.max(np.abs(ref - got))) / scale if scale > 0 else 0.0
+
+
 def check_dense(backend: Backend, z, u, t, dt, p, tol=1e-9) -> dict:
-    """dense at t+dt equals the step result; dense at t+dt/2 equals a half-length step (all blocks)."""
+    """dense at t+dt equals the step result (every block); dense at t+dt/2 equals a step of half the duration. Errors are relative to the size
+    of each block (a block of 1e7 and one of 1e-10 are both checked to `tol`).
+
+    At the half step only impulses (role "delta_v") are compared among the controls, and other controls must be zero: a control spread over
+    the step (a piecewise acceleration on sub-intervals of dt) is defined relative to the step, so the half-length step has a different
+    control, and its Jacobian block differs by definition.
+
+    `tol` follows the back-end's stated accuracy, not a fixed number: J["dt"] of dense output is the derivative with respect to the offset of
+    the epoch on the step's grid, J["dt"] of a half-length step the derivative with respect to its duration, and for a fixed-step integrator
+    the two differ by its truncation error."""
+    d = backend.describe()
+    for c in d.controls:
+        if c.role != "delta_v" and c.name in u and np.any(np.asarray(u[c.name]) != 0):
+            raise ValueError(f"check_dense: control {c.name!r} (role {c.role!r}) must be zero; the half-step comparison holds for impulses only")
+    spread = {c.name for c in d.controls if c.role != "delta_v"}
     res = backend.step(z, u, t, dt, p)
     dn = res.dense(np.array([t + dt / 2, t + dt]), partials=True)
     zt, Jt = dn.z, dn.J
     assert res.dense(np.array([t + dt / 2, t + dt])).J is None, "partials=False must not return a Jacobian tree"
     half = backend.step(z, u, t, dt / 2, p)
-    e_end = float(np.max(np.abs(np.asarray(zt[1]) - np.asarray(res.z))))
-    e_half = float(np.max(np.abs(np.asarray(zt[0]) - np.asarray(half.z))))
+    e_end = _rel(res.z, np.asarray(zt)[1])
+    e_half = _rel(half.z, np.asarray(zt)[0])
     e_J_half = e_J_end = 0.0
     for path, leaf in leaves(Jt):
-        e_J_half = max(e_J_half, float(np.max(np.abs(np.asarray(leaf)[0] - np.asarray(get(half.J, path))))))
-        e_J_end = max(e_J_end, float(np.max(np.abs(np.asarray(leaf)[1] - np.asarray(get(res.J, path))))))
+        e_J_end = max(e_J_end, _rel(get(res.J, path), np.asarray(leaf)[1]))
+        if path[0] == "u" and path[1] in spread:
+            continue
+        e_J_half = max(e_J_half, _rel(get(half.J, path), np.asarray(leaf)[0]))
     assert max(e_end, e_half, e_J_half, e_J_end) < tol, (e_end, e_half, e_J_half, e_J_end)
     return {"end_state": e_end, "half_state": e_half, "half_J": e_J_half, "end_J": e_J_end}
 

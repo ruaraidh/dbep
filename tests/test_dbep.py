@@ -382,3 +382,96 @@ def test_translation_path_equals_the_general_path():
         assert np.max(np.abs(np.asarray(leaf) - np.asarray(dbep.get(da.J, path)))) < 1e-12, path
     entity = Converted(TwoOsc(), StateRequest(slices=(SliceRequest("r", centre="AST"), SliceRequest("v", centre="AST"))), CircleEphemeris())
     assert not entity._translation
+
+
+class _OscAcc:
+    """The toy with a piecewise-constant acceleration `acc` on 2 equal sub-intervals of dt, like didi's adapter. Fixed-step RK4 with the number
+    of steps set by dt (N = round(dt / H0)), so a half-length step has the same grid; dense output uses the step's own grid: full steps to the
+    node before the epoch, then one partial step."""
+    H0 = 0.05
+
+    def __init__(self):
+        d = eo.OscillatorBackend(differentiate=("k",)).describe()
+        self._d = dataclasses.replace(d, controls=d.controls + (Control("acc", (2, 3), "acceleration", "km/s^2"),))
+        self._meta = self._d.state_meta()
+
+    def describe(self):
+        return self._d
+
+    def _map(self, i, h, tau, N):
+        z, u, t, p = i["z"], i["u"], i["t"], i["p"]
+        x = z.at[3:].add(u["dv"])
+
+        def f(tt, s, j):
+            return jnp.concatenate([s[3:], -p["k"] * s[:3] + u["acc"][j]])
+
+        def rk(s, t0, hh, j):
+            k1 = f(t0, s, j); k2 = f(t0 + hh / 2, s + hh / 2 * k1, j); k3 = f(t0 + hh / 2, s + hh / 2 * k2, j); k4 = f(t0 + hh, s + hh * k3, j)
+            return s + hh / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+        K = jnp.clip(jnp.floor(jax.lax.stop_gradient(tau) / h), 0, N - 1).astype(jnp.int32)
+        x = jax.lax.fori_loop(0, K, lambda m, s: rk(s, t + m * h, h, (2 * m) // N), x)
+        return rk(x, t + K * h, tau - K * h, (2 * K) // N)
+
+    def step(self, z, u, t, dt, p):
+        f64 = lambda a: jnp.asarray(a, dtype=jnp.float64)
+        u = {"dv": jnp.zeros(3), "acc": jnp.zeros((2, 3)), **u}
+        i = {"z": f64(z), "u": {k: f64(v) for k, v in u.items()}, "t": f64(t), "p": {"k": f64(p.get("k", 1.0))}}
+        N = max(2, int(round(float(dt) / self.H0)))
+        h = f64(dt) / N
+        g = lambda inp: self._map({k: v for k, v in inp.items() if k != "dt"}, inp["dt"] / N, inp["dt"], N)
+        full = {**i, "dt": f64(dt)}
+        z1, J = g(full), jax.jacfwd(g)(full)
+
+        def dense(t_vec, partials=False):
+            taus = jnp.asarray(t_vec, dtype=jnp.float64) - i["t"]
+            fd = lambda ii, tt: jax.vmap(lambda ta: self._map(ii, jax.lax.stop_gradient(h), ta, N))(tt)
+            zs = fd(i, taus)
+            if not partials:
+                return dbep.DenseResult(z=zs, meta=self._meta, J=None)
+            Js = jax.jacfwd(fd, argnums=0)(i, taus)
+            Js["dt"] = jax.jvp(lambda tt: fd(i, tt), (taus,), (jnp.ones_like(taus),))[1]
+            return dbep.DenseResult(z=zs, meta=self._meta, J=Js)
+        return StepResult(z=z1, J=J, status=jnp.int32(0), meta=self._meta, _dense=dense)
+
+
+def test_check_dense_compares_only_impulses_at_the_half_step():
+    """A piecewise acceleration is defined on sub-intervals of the step: a half-length step has another control, so its block differs from the
+    dense block at mid-step even for a correct back-end. check_dense compares impulses only there (all blocks at the end), and refuses a
+    non-zero spread control."""
+    b = _OscAcc()
+    # tol 1e-6: at the half step the J["dt"] of dense output (offset on a fixed grid) and of a step (duration with the grid scaling) differ by
+    # the integrator's truncation error, 1.6e-7 for this RK4 toy (didi's RK8: 4e-16); states and every other block agree to rounding
+    errs = dbep.check_dense(b, Z0, U0, 0.0, 10.0, {"k": 0.8}, tol=1e-6)
+    assert errs["half_state"] < 1e-12 and errs["end_J"] < 1e-12
+    with pytest.raises(ValueError, match="impulses only"):
+        dbep.check_dense(b, Z0, {**U0, "acc": np.ones((2, 3))}, 0.0, 10.0, {"k": 0.8})
+
+
+def test_check_dense_errors_are_relative_to_each_block():
+    """A back-end with blocks of 1e9 (positions in units of 1e-9) passes: its absolute rounding is about 1e-7, which an absolute tolerance of
+    1e-9 refused. A 1e-6 relative error in a block is still caught."""
+    S = 1e9
+
+    class Big:
+        def __init__(self, scale_k=1.0):
+            self._n, self._s = eo.OscillatorBackend(differentiate=("k",)), scale_k
+
+        def describe(self):
+            return self._n.describe()
+
+        def _scale(self, J, k=1.0):
+            out = {"z": J["z"], "t": S * J["t"], "dt": S * J["dt"], "u": J["u"], "p": {"k": S * k * J["p"]["k"]}}
+            return out
+
+        def step(self, z, u, t, dt, p):
+            r = self._n.step(jnp.asarray(z) / S, {kk: jnp.asarray(v) / S for kk, v in u.items()}, t, dt, p)
+
+            def dense(t_vec, partials=False):
+                d = r.dense(t_vec, partials)
+                return dbep.DenseResult(z=S * d.z, meta=d.meta, J=None if d.J is None else self._scale(d.J, self._s))
+            return StepResult(S * r.z, self._scale(r.J), r.status, r.meta, dense)
+
+    z, u = S * Z0, {"dv": S * U0["dv"]}
+    assert max(dbep.check_dense(Big(), z, u, 0.0, 10.0, P0).values()) < 1e-9
+    with pytest.raises(AssertionError):
+        dbep.check_dense(Big(scale_k=1 + 1e-6), z, u, 0.0, 10.0, P0)
