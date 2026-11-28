@@ -252,7 +252,7 @@ def test_tolerance_is_relative_to_the_block():
 def test_check_refuses_other_protocol_versions():
     d = eo.OscillatorBackend(differentiate=("k",)).describe()
     dbep.check(Requires("orbital/1"), d)
-    for bad in ("DBE-P/1.0", "DBE-P/7.3", "DBE-P/0.6", "DBE-P/0.8", "XYZ/0.7", "DBE-P", "garbage"):
+    for bad in ("DBE-P/1.0", "DBE-P/7.3", "DBE-P/0.7", "DBE-P/0.9", "XYZ/0.8", "DBE-P", "garbage"):
         with pytest.raises(DBEPMismatch, match="protocol"):
             dbep.check(Requires("orbital/1"), dataclasses.replace(d, protocol=bad))
 
@@ -475,3 +475,28 @@ def test_check_dense_errors_are_relative_to_each_block():
     assert max(dbep.check_dense(Big(), z, u, 0.0, 10.0, P0).values()) < 1e-9
     with pytest.raises(AssertionError):
         dbep.check_dense(Big(scale_k=1 + 1e-6), z, u, 0.0, 10.0, P0)
+
+
+class _CoveredEphemeris(CircleEphemeris):
+    """The toy ephemeris with a coverage window per body (DBE-P 0.8): ORIGIN to t = 50 s, PLANET to t = 30 s."""
+    def coverage(self, body):
+        return {"ORIGIN": (-100.0, 50.0), "PLANET": (-100.0, 30.0)}[body]
+
+
+def test_converted_sets_the_coverage_bit():
+    """A step that leaves the coverage of a body the conversion reads gets status bit 3; inside it the status is the native one. A provider
+    without `coverage` is unlimited. An entity centre follows to its own centre (AST is relative to ORIGIN)."""
+    native = eo.OscillatorBackend(differentiate=("k",))
+    w = Converted(native, WANT_SSB, _CoveredEphemeris())                       # reads ORIGIN
+    assert int(w.step(Z0, U0, 0.0, 10.0, P0).status) == 0
+    assert int(w.step(Z0, U0, 45.0, 10.0, P0).status) & (1 << 3)               # ends after ORIGIN's coverage
+    assert int(w.step(Z0, U0, -120.0, 10.0, P0).status) & (1 << 3)            # starts before it
+    planet = Converted(native, StateRequest((SliceRequest("r", centre="PLANET"), SliceRequest("v", centre="PLANET"))), _CoveredEphemeris())
+    assert int(planet.step(Z0, U0, 25.0, 10.0, P0).status) & (1 << 3)          # PLANET's window is the shorter one
+    assert int(Converted(native, WANT_SSB, CircleEphemeris()).step(Z0, U0, 45.0, 10.0, P0).status) == 0      # no coverage: unlimited
+    z0 = np.array([1.0, 0.0, 0.2, 0.0, 0.5, 0.0, 0.3, -0.2, 0.1, 0.05, 0.02, -0.01])
+    ent = Converted(TwoOsc(), StateRequest((SliceRequest("r", centre="AST"), SliceRequest("v", centre="AST"))), _CoveredEphemeris())
+    assert ent._ephemeris_bodies() == {"ORIGIN"}
+    assert int(ent.step(z0, {"dv": np.zeros(3)}, 45.0, 10.0, {"k": 0.8}).status) & (1 << 3)
+    jit_status = jax.jit(lambda t: w.step(Z0, U0, t, 10.0, P0).status)(45.0)   # set inside jit, without raising
+    assert int(jit_status) & (1 << 3)

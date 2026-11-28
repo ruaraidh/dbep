@@ -1,7 +1,12 @@
 # DBE-P: dynamics back-end protocol
 
-Status: draft v0.7 (proposal, for review)
+Status: draft v0.8 (proposal, for review)
 Reference code: `dbep.py` (types, requirement check, conformance suite, conversion wrapper `Converted`, quaternion and orientation toolkit), `example_oscillator.py` (toy back-end and consumer), `test_dbep.py` (tests of the toolkit)
+
+Changes from DBE-P v0.7 (minor: an optional method, and a rule that records a decision):
+- **Ephemeris coverage (sections 8.2 rule 9, 10).** `EphemerisProvider` MAY have `coverage(body) -> (first, last)`, the TDB epochs for which the body is tabulated. `Converted` intersects the coverage of every body its conversions read, including the centres behind an entity centre, and sets status bit 3 on a step that leaves it, inside jit, without raising. A provider without `coverage` is unlimited.
+- **A change of central body is a step boundary (section 8.2, rule 10).** A back-end has one native centre per slice. A trajectory whose integration centre changes (an Earth-centred arc, then a Moon-centred one) is one back-end per arc, all requested in the same coordinates. The consumer steps to the switch epoch and chains the steps (section 12, rule 1).
+- Open question 8 is closed: the production `EphemerisProvider` is didi's, on its DE440 Chebyshev segments.
 
 Toolkit change in `dbep` 0.7.2 (protocol unchanged): `check_dense` measures errors relative to each block, and at the half step compares impulses only (other controls must be zero), as `check_chaining` does. Before, one absolute tolerance covered blocks of very different sizes, and a correct back-end with a piecewise acceleration failed.
 
@@ -87,7 +92,7 @@ A back-end publishes `describe() -> Descriptor` with:
 
 | Field | Content |
 |---|---|
-| `protocol` | `"DBE-P/0.7"` |
+| `protocol` | `"DBE-P/0.8"` |
 | `profile` | e.g. `"orbital/1"` |
 | `time` | scale, epoch and unit of `t` and `dt` |
 | `state` | ordered slices: `name`, `size`, `role`, `unit`, `axes`, `centre` |
@@ -229,6 +234,8 @@ For a change of centre, `T` is a translation: `T(t)(z) = z + m(t)`, where `m(t)`
        def state(self, body: str, t) -> Array    # (6,) position [km], velocity [km/s] relative to the SSB, ICRF, TDB
    ```
    A centre is `"SSB"`, a body the provider knows (it raises `KeyError` otherwise), or an entity in `z`. The wrapper refuses (`DBEPUnsupported`) a body it cannot resolve, a cycle, non-ICRF axes, a unit it does not convert, a request that gives `r` and `v` different centres, and an entity used as a centre that is itself re-centred in the same request.
+   The provider MAY also give `coverage(body) -> (first, last)`, the TDB epochs [s] for which `body` is tabulated (DBE-P 0.8). `Converted` then sets status bit 3 (section 10) on a step whose start or end falls outside the coverage of a body it reads; dense epochs lie inside the step and need no check of their own. A provider without `coverage` is unlimited.
+10. **A change of central body is a step boundary.** A back-end has one native centre per slice for the whole step. A trajectory integrated about different bodies in turn (an Earth-centred arc, then a Moon-centred one) is modelled as one back-end per arc, all built with the same `StateRequest`. The consumer steps to the switch epoch and chains the steps (section 12, rule 1), so the switch needs no rule of its own. A back-end MAY hide such switches inside a step if it declares one native centre and its Jacobians stay those of the whole step (the epoch rule applies to the pieces), but no back-end is required to.
 
 ### 8.3 Metadata
 
@@ -434,7 +441,7 @@ The impulse frame rotation depends on the state, so the back-end includes `∂R/
 | 5 | Negative `dt` (backward propagation) in the core or by capability | smoothing |
 | 6 | Naming (`step` vs `flow` or `transition`) | API |
 | 7 | Whether controls also need a `differentiated` flag, so unused control columns are not computed | cost |
-| 8 | Which package provides the production `EphemerisProvider` (didi's Chebyshev ephemeris, or ephemerix), and the interpolation order of its derivatives | architecture |
+| 8 | ~~Which package provides the production `EphemerisProvider`~~ **Closed (0.8):** didi, on its DE440 Chebyshev segments (didi MIGRATION step 3) | architecture |
 | 9 | Non-inertial axes (EME2000, body-fixed): definition of "velocity" in them | later profile version |
 | 10 | Whether a `StateRequest` may also change the layout (ordering, grouping of slices), or only centre, axes and unit | consumer convenience |
 
