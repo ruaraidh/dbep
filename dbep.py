@@ -1,4 +1,4 @@
-"""DBE-P: dynamics back-end protocol, draft 0.7.
+"""DBE-P: dynamics back-end protocol, draft 0.8.
 
 Types, a requirement check and a conformance suite. No dynamics live here.
 A *back-end* implements `Backend`; a *consumer* states what it needs with
@@ -35,7 +35,7 @@ import numpy as np
 jax.config.update("jax_enable_x64", True)          # the protocol is float64
 
 Array = Any
-PROTOCOL = "DBE-P/0.7"
+PROTOCOL = "DBE-P/0.8"
 
 
 # ----------------------------------------------------------------------------- descriptor pieces
@@ -326,6 +326,19 @@ class EphemerisProvider(Protocol):
         MUST be traceable and differentiable in `t` (the wrapper differentiates it for the time terms). Raise
         KeyError for a body it does not have."""
 
+    # Optional (DBE-P 0.8): def coverage(self, body: str) -> tuple[float, float]
+    #     (first, last) TDB epoch [s] for which `body` is tabulated. A provider without it is taken as unlimited. `Converted` sets status
+    #     bit 3 (outside coverage) on a step that leaves the coverage of a body it converts through.
+
+
+def _coverage(provider, bodies):
+    """(first, last) epoch covered for all `bodies` by `provider`, or None when the provider has no `coverage` (unlimited) or no body is used."""
+    f = getattr(provider, "coverage", None)
+    if f is None or not bodies:
+        return None
+    spans = [tuple(float(x) for x in f(b)) for b in bodies]
+    return max(s[0] for s in spans), min(s[1] for s in spans)
+
 
 class Converted:
     """A back-end honouring a StateRequest, built from a native back-end (DBE-P section 8.2).
@@ -395,6 +408,22 @@ class Converted:
             eph = f"{eph}+{ephemeris.id}" if eph else ephemeris.id
         self._d = dataclasses.replace(nd, state=tuple(new[s.name] for s in nd.state), ephemeris=eph)
         self._meta = self._d.state_meta()
+        self._window = _coverage(ephemeris, sorted(self._ephemeris_bodies()))
+
+    def _ephemeris_bodies(self):
+        """The bodies the conversions read from the ephemeris: every centre that is not the SSB, following entity centres to their own centre."""
+        out = set()
+        for _, _, cn, cr, _ in self._conv:
+            for c in (cn, cr):
+                for _ in range(10):
+                    if c == "SSB":
+                        break
+                    if c in self._entities:
+                        c = self._entities[c][2]
+                        continue
+                    out.add(c)
+                    break
+        return out
 
     # -- conversion pieces
     def _X(self, name, z, t, depth=0):
@@ -463,7 +492,12 @@ class Converted:
             Ji = jax.vmap(self._jtree, in_axes=(0, 0, 0, None, None))(dn.J, Mi, dTi, M0inv, dT0)
             return DenseResult(z=zi, meta=self._meta, J=Ji)
 
-        return StepResult(z=zend, J=J, status=res.status, meta=self._meta, _dense=dense)
+        status = jnp.asarray(res.status, jnp.int32)
+        if self._window is not None:                          # a conversion read the ephemeris outside its coverage (section 10, bit 3)
+            lo, hi = self._window
+            t_a, t_b = jnp.minimum(t, t + dt), jnp.maximum(t, t + dt)
+            status = status | jnp.where((t_a < lo) | (t_b > hi), 1 << 3, 0).astype(jnp.int32)
+        return StepResult(z=zend, J=J, status=status, meta=self._meta, _dense=dense)
 
 
 # ----------------------------------------------------------------------------- orientation (section 8.6)
